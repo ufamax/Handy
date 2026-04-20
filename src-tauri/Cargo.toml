@@ -1,6 +1,6 @@
 [package]
 name = "handy"
-version = "0.8.2"
+version = "0.8.3"
 description = "Handy"
 authors = ["cjpais"]
 edition = "2021"
@@ -55,7 +55,8 @@ hound = "3.5.1"
 log = "0.4.25"
 env_filter = "0.1.0"
 tokio = "1.43.0"
-vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
+ort = "=2.0.0-rc.12"
+ndarray = "0.17"
 enigo = "0.6.1"
 rodio = { git = "https://github.com/cjpais/rodio.git" }
 reqwest = { version = "0.12", features = ["json", "stream"] }

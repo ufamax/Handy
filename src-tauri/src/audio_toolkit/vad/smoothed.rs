@@ -1,6 +1,64 @@
 use super::{VadFrame, VoiceActivityDetector};
 use anyhow::Result;
-use std::collections::VecDeque;
+
+/// Pre-allocated circular frame buffer that avoids per-frame heap allocations.
+/// Stores up to `capacity` frames of `frame_size` samples in a flat Vec.
+struct FrameRing {
+    data: Vec<f32>,
+    frame_size: usize,
+    capacity: usize,
+    head: usize,
+    count: usize,
+}
+
+impl FrameRing {
+    fn new(capacity: usize, frame_size: usize) -> Self {
+        Self {
+            data: vec![0.0; capacity * frame_size],
+            frame_size,
+            capacity,
+            head: 0,
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, frame: &[f32]) {
+        let write_idx = (self.head + self.count) % self.capacity;
+        let offset = write_idx * self.frame_size;
+        self.data[offset..offset + self.frame_size].copy_from_slice(frame);
+
+        if self.count < self.capacity {
+            self.count += 1;
+        } else {
+            self.head = (self.head + 1) % self.capacity;
+        }
+    }
+
+    /// Drain all frames into a flat Vec, oldest first. Resets the ring.
+    fn drain_to_vec(&mut self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.count * self.frame_size);
+        for i in 0..self.count {
+            let idx = (self.head + i) % self.capacity;
+            let offset = idx * self.frame_size;
+            out.extend_from_slice(&self.data[offset..offset + self.frame_size]);
+        }
+        self.head = 0;
+        self.count = 0;
+        out
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+
+    /// Remove the most recently pushed frame.
+    fn pop_back(&mut self) {
+        if self.count > 0 {
+            self.count -= 1;
+        }
+    }
+}
 
 pub struct SmoothedVad {
     inner_vad: Box<dyn VoiceActivityDetector>,
@@ -8,7 +66,7 @@ pub struct SmoothedVad {
     hangover_frames: usize,
     onset_frames: usize,
 
-    frame_buffer: VecDeque<Vec<f32>>,
+    frame_ring: FrameRing,
     hangover_counter: usize,
     onset_counter: usize,
     in_speech: bool,
@@ -23,60 +81,58 @@ impl SmoothedVad {
         hangover_frames: usize,
         onset_frames: usize,
     ) -> Self {
+        let frame_size = 480; // SILERO_FRAME_SAMPLES (30ms @ 16kHz)
+        let ring_capacity = if prefill_frames > 0 {
+            prefill_frames + 1
+        } else {
+            0
+        };
+
         Self {
             inner_vad,
             prefill_frames,
             hangover_frames,
             onset_frames,
-            frame_buffer: VecDeque::new(),
+            frame_ring: FrameRing::new(ring_capacity, frame_size),
             hangover_counter: 0,
             onset_counter: 0,
             in_speech: false,
-            temp_out: Vec::new(),
+            temp_out: Vec::with_capacity(ring_capacity * frame_size),
         }
     }
 }
 
 impl VoiceActivityDetector for SmoothedVad {
     fn push_frame<'a>(&'a mut self, frame: &'a [f32]) -> Result<VadFrame<'a>> {
-        // 1. Buffer every incoming frame for possible pre-roll
-        self.frame_buffer.push_back(frame.to_vec());
-        while self.frame_buffer.len() > self.prefill_frames + 1 {
-            self.frame_buffer.pop_front();
+        if self.prefill_frames > 0 {
+            self.frame_ring.push(frame);
         }
 
-        // 2. Delegate to the wrapped boolean VAD
         let is_voice = self.inner_vad.is_voice(frame)?;
 
         match (self.in_speech, is_voice) {
-            // Potential start of speech - need to accumulate onset frames
             (false, true) => {
                 self.onset_counter += 1;
                 if self.onset_counter >= self.onset_frames {
-                    // We have enough consecutive voice frames to trigger speech
                     self.in_speech = true;
                     self.hangover_counter = self.hangover_frames;
-                    self.onset_counter = 0; // Reset for next time
+                    self.onset_counter = 0;
 
-                    // Collect prefill + current frame
-                    self.temp_out.clear();
-                    for buf in &self.frame_buffer {
-                        self.temp_out.extend(buf);
-                    }
+                    // Pop the current frame — caller already has it
+                    self.frame_ring.pop_back();
+                    self.temp_out = self.frame_ring.drain_to_vec();
+                    self.temp_out.extend_from_slice(frame);
                     Ok(VadFrame::Speech(&self.temp_out))
                 } else {
-                    // Not enough frames yet, still silence
                     Ok(VadFrame::Noise)
                 }
             }
 
-            // Ongoing Speech
             (true, true) => {
                 self.hangover_counter = self.hangover_frames;
                 Ok(VadFrame::Speech(frame))
             }
 
-            // End of Speech or interruption during onset phase
             (true, false) => {
                 if self.hangover_counter > 0 {
                     self.hangover_counter -= 1;
@@ -87,16 +143,15 @@ impl VoiceActivityDetector for SmoothedVad {
                 }
             }
 
-            // Silence or broken onset sequence
             (false, false) => {
-                self.onset_counter = 0; // Reset onset counter on silence
+                self.onset_counter = 0;
                 Ok(VadFrame::Noise)
             }
         }
     }
 
     fn reset(&mut self) {
-        self.frame_buffer.clear();
+        self.frame_ring.clear();
         self.hangover_counter = 0;
         self.onset_counter = 0;
         self.in_speech = false;
